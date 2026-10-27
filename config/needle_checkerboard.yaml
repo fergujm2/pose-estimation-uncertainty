@@ -1,0 +1,18 @@
+# The 2 mm 4x5 checkerboard mounted on the suturing needle (ALISS endoscope), live chain:
+# rectified image from needle_inference_node (rectify:=true) or image_proc.
+pose_estimator:
+  ros__parameters:
+    image_rect_topic: "/ves_camera/image_rect"
+    camera_info_topic: "/ves_camera/camera_info"
+
+    board_type: "checkerboard"
+    squares_x: 4   # square (i, j) is white when i + j is even; dots in squares (2,2), (3,2), (2,3)
+    squares_y: 5
+    square_size: 0.002
+
+    # Corner noise, px: pooled reprojection residual over the 10 static 2026-10-12 bags (567
+    # frames, 0.32-0.54 px per bag). Recalibrate from /pose_estimator/residual (pooled sigma on
+    # the annotated image). Frame-to-frame jitter is smaller; see pinpoint_py board_consistency.py.
+    pixel_noise_sigma: 0.44
+    max_rms_px: 3.0             # good fits are 0.3-0.9 px, misdetections 10-24 px
+    min_colour_contrast: 20.0

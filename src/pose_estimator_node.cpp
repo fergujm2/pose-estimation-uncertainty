@@ -18,30 +18,53 @@ PoseEstimatorNode::PoseEstimatorNode()
     rclcpp::Node("pose_estimator"), 
     distortion_coeffs_({0.0, 0.0, 0.0, 0.0, 0.0})
 {
-    // Init ChArUco board from params
-    std::string aruco_dict_name = this->declare_parameter<std::string>("aruco_dictionary");
-    int squares_x = this->declare_parameter<int>("squares_x");
-    int squares_y = this->declare_parameter<int>("squares_y");
-    double square_size = this->declare_parameter<double>("square_size");
-    board_ = generate_charuco_board(aruco_dict_name, squares_x, squares_y, square_size);
+    std::string board_type = this->declare_parameter<std::string>("board_type", "charuco");
+    squares_x_ = this->declare_parameter<int>("squares_x");
+    squares_y_ = this->declare_parameter<int>("squares_y");
+    square_size_ = this->declare_parameter<double>("square_size");
+    // Frame of the published pose; empty uses the image's frame_id (the camera optical frame)
+    frame_id_ = this->declare_parameter<std::string>("frame_id", "");
+    // Frames whose corner reprojection RMS exceeds this are rejected (bad detection)
+    max_rms_px_ = this->declare_parameter<double>("max_rms_px", 3.0);
 
-    // Save the board to file for debugging, etc
-    cv::Mat image;
-    int pixels_per_square = 300;
-    cv::Size size(pixels_per_square * squares_x, pixels_per_square * squares_y);
-    board_->draw(size, image, 100, 1);
+    if (board_type == "checkerboard") {
+        board_type_ = BoardType::CHECKERBOARD;
+        checkerboard_ = Checkerboard{squares_x_, squares_y_, square_size_};
+        // Gray levels between white and black squares needed to trust the orientation
+        min_colour_contrast_ = this->declare_parameter<double>("min_colour_contrast", 20.0);
+        if (!checkerboard_->colours_fix_orientation()) {
+            RCLCPP_WARN(get_logger(),
+                "A %dx%d checkerboard looks the same turned 180 degrees: its pose is ambiguous. "
+                "Use a board with squares_x + squares_y odd.", squares_x_, squares_y_);
+        }
+        RCLCPP_INFO(get_logger(), "Checkerboard %dx%d squares of %.4f m", squares_x_, squares_y_,
+            square_size_);
+    } else if (board_type == "charuco") {
+        board_type_ = BoardType::CHARUCO;
+        // Init ChArUco board from params
+        std::string aruco_dict_name = this->declare_parameter<std::string>("aruco_dictionary");
+        board_ = generate_charuco_board(aruco_dict_name, squares_x_, squares_y_, square_size_);
 
-    std::ostringstream ss;
-    ss << "target_board_"
-        << aruco_dict_name << "_"
-        << squares_x << "x" << squares_y << ".png";
+        // Save the board to file for debugging, etc
+        cv::Mat image;
+        int pixels_per_square = 300;
+        cv::Size size(pixels_per_square * squares_x_, pixels_per_square * squares_y_);
+        board_->draw(size, image, 100, 1);
 
-    std::string filename = ss.str();
-    cv::imwrite(filename, image);
-    RCLCPP_INFO(get_logger(), 
-        "Saved target ChArUco board image to file: %s\n"
-        "Ensure that your physical board matches this image!", 
-        filename.c_str());
+        std::ostringstream ss;
+        ss << "target_board_"
+            << aruco_dict_name << "_"
+            << squares_x_ << "x" << squares_y_ << ".png";
+
+        std::string filename = ss.str();
+        cv::imwrite(filename, image);
+        RCLCPP_INFO(get_logger(), 
+            "Saved target ChArUco board image to file: %s\n"
+            "Ensure that your physical board matches this image!", 
+            filename.c_str());
+    } else {
+        throw std::runtime_error("board_type must be 'charuco' or 'checkerboard', got '" + board_type + "'");
+    }
 
     // Init pixel noise model from params
     double pixel_noise_sigma = this->declare_parameter<double>("pixel_noise_sigma");
@@ -59,6 +82,9 @@ PoseEstimatorNode::PoseEstimatorNode()
     // Publishers
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/pose_estimator/pose", 1);
     image_pub_ = create_publisher<sensor_msgs::msg::Image>("/pose_estimator/annotated_image", 1);
+    // Per accepted frame: [sum of squared corner reprojection errors (px^2), number of corners],
+    // for calibrating pixel_noise_sigma (pooled sigma^2 = sum / (2 N - 6) over frames)
+    residual_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>("/pose_estimator/residual", 10);
 
 }
 
@@ -109,6 +135,10 @@ Pose3Gaussian PoseEstimatorNode::optimize_board_pose(
     Pose3Gaussian result;
     result.mean = values.at<Pose3>(pose_key);
     result.covariance = marginals.marginalCovariance(pose_key);
+    // graph.error is half the whitened squared error; undo the whitening for pixels^2
+    const double sigma = pixel_noise_->sigmas()(0);
+    result.residual_sq = 2.0 * graph.error(values) * sigma * sigma;
+    result.num_points = static_cast<int>(image_points.size());
 
     return result;
 }
@@ -131,6 +161,57 @@ bool check_points_colinear(const std::vector<cv::Point2f>& pts) {
 
 std::optional<Pose3Gaussian> PoseEstimatorNode::process_frame(const cv::Mat& frame, cv::Mat& annotated) {
     frame.copyTo(annotated);
+    if (board_type_ == BoardType::CHECKERBOARD) {
+        return process_checkerboard_frame(frame, annotated);
+    }
+    return process_charuco_frame(frame, annotated);
+}
+
+
+std::optional<Pose3Gaussian> PoseEstimatorNode::process_checkerboard_frame(const cv::Mat& frame, cv::Mat& annotated) {
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+    std::string why;
+    auto corners = detect_checkerboard(gray, *checkerboard_, min_colour_contrast_, why);
+    if (!corners) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Checkerboard: %s", why.c_str());
+        return {};
+    }
+    cv::drawChessboardCorners(annotated, checkerboard_->pattern_size(), *corners, true);
+    cv::circle(annotated, (*corners)[0], 8, cv::Scalar(0, 0, 255), 2);   // corner (0, 0)
+
+    // IPPE: the planar PnP solution, as the initial guess for the refinement
+    const std::vector<cv::Point3f> points_3d = checkerboard_->corners();
+    cv::Vec3d rvec, tvec;
+    if (!cv::solvePnP(points_3d, *corners, *camera_matrix_cv_, distortion_coeffs_, rvec, tvec,
+                      false, cv::SOLVEPNP_IPPE)) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Checkerboard: solvePnP failed");
+        return {};
+    }
+
+    try {
+        Pose3Gaussian pose = optimize_board_pose(points_3d, *corners, cv_to_gtsam(rvec, tvec));
+        // The board z axis points into the printed face. Facing the camera, it points away from
+        // it; otherwise the corners were mirrored (the board seen from behind).
+        if (pose.mean.rotation().matrix()(2, 2) <= 0.0) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                "Checkerboard: mirrored corner order (board facing away); rejected");
+            return {};
+        }
+        draw_board_pose(pose.mean, annotated);
+        return pose;
+    } catch (const gtsam::IndeterminantLinearSystemException& e) {
+        RCLCPP_ERROR(get_logger(), "Optimization failed: %s", e.what());
+        return {};
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "Unexpected error during optimization: %s", e.what());
+        return {};
+    }
+}
+
+
+std::optional<Pose3Gaussian> PoseEstimatorNode::process_charuco_frame(const cv::Mat& frame, cv::Mat& annotated) {
 
     std::vector<int> marker_ids;
     std::vector<std::vector<cv::Point2f>> marker_corners;
@@ -235,8 +316,7 @@ void PoseEstimatorNode::draw_board_pose(const gtsam::Pose3& pose, cv::Mat& image
     gtsam_to_cv(pose, R, t);
 
     // Axis length: square length times min of num squares in x/y
-    cv::Size sz = board_->getChessboardSize();
-    float axis_length = std::min(sz.width, sz.height) * board_->getSquareLength();
+    float axis_length = std::min(squares_x_, squares_y_) * square_size_;
 
     cv::drawFrameAxes(image, *camera_matrix_cv_, distortion_coeffs_, R, t, axis_length);
 }
@@ -265,7 +345,7 @@ void PoseEstimatorNode::camera_info_callback(sensor_msgs::msg::CameraInfo::Const
         camera_matrix_cv_->at<double>(1,2)  // cy
     );
 
-    RCLCPP_INFO(get_logger(), "Camera info received, ready to estimate ChArUco board poses");
+    RCLCPP_INFO(get_logger(), "Camera info received, ready to estimate board poses");
 }
 
 
@@ -336,6 +416,25 @@ void PoseEstimatorNode::image_callback(sensor_msgs::msg::Image::ConstSharedPtr m
     auto end = std::chrono::high_resolution_clock::now();
     int elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
+    // Reject bad fits: the corners do not match the board well enough to trust the pose
+    if (pose) {
+        const double rms = std::sqrt(pose->residual_sq / pose->num_points);
+        if (rms > max_rms_px_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                "Corner reprojection RMS %.2f px > max_rms_px %.2f; rejected", rms, max_rms_px_);
+            pose.reset();
+        } else {
+            pooled_residual_sq_ += pose->residual_sq;
+            pooled_dof_ += 2 * pose->num_points - 6;
+            const double sigma_pos = 1e3 * std::sqrt(pose->covariance.bottomRightCorner<3, 3>().trace());
+            cv::putText(annotated,
+                cv::format("rms %.2f px  pooled sigma %.2f px  pos +-%.2f mm", rms,
+                           std::sqrt(pooled_residual_sq_ / pooled_dof_), sigma_pos),
+                cv::Point(20, annotated.rows - 20), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        }
+    }
+
     // Publish annotated image no matter what
     cv_bridge::CvImage out;
     out.header = msg->header;
@@ -350,7 +449,7 @@ void PoseEstimatorNode::image_callback(sensor_msgs::msg::Image::ConstSharedPtr m
             get_logger(),
             *get_clock(),
             1000,   // ms
-            "Charuco pose estimation failed"
+            "Board pose estimation failed"
         );
         return;
     }
@@ -358,9 +457,13 @@ void PoseEstimatorNode::image_callback(sensor_msgs::msg::Image::ConstSharedPtr m
     // Log/publish pose
     log_results(*pose, elapsed_ms);
 
+    std_msgs::msg::Float64MultiArray residual;
+    residual.data = {pose->residual_sq, static_cast<double>(pose->num_points)};
+    residual_pub_->publish(residual);
+
     geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
     pose_msg.header.stamp = msg->header.stamp;
-    pose_msg.header.frame_id = "world";  // TODO: make this a param
+    pose_msg.header.frame_id = frame_id_.empty() ? msg->header.frame_id : frame_id_;
     
     auto t = pose->mean.translation();
     pose_msg.pose.pose.position.x = t.x();

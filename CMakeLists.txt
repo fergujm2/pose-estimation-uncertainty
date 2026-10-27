@@ -6,6 +6,7 @@ find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 
@@ -33,6 +34,7 @@ ament_target_dependencies(pose_estimator
     rclcpp
     geometry_msgs
     sensor_msgs
+    std_msgs
     cv_bridge
     visualization_msgs
 )
