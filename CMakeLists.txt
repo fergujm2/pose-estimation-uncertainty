@@ -11,7 +11,10 @@ find_package(visualization_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 
 find_package(Eigen3 REQUIRED)
-find_package(GTSAM REQUIRED)
+# Pin the /usr/local GTSAM 4.3 install, as pinpoint does. NO_DEFAULT_PATH because the sourced
+# workspace's CMAKE_PREFIX_PATH (searched before HINTS) contains ves_smoother's GTSAMConfig.cmake,
+# whose installed headers lack NoiseModelFactorN.
+find_package(GTSAM 4.3 REQUIRED PATHS /usr/local/lib/cmake/GTSAM NO_DEFAULT_PATH)
 find_package(OpenCV REQUIRED)
 
 # Interface library for executables
@@ -78,5 +81,12 @@ install(DIRECTORY config
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
+
+# ves_smoother puts its own libgtsam.so.4 on LD_LIBRARY_PATH. DT_RPATH (unlike RUNPATH) is searched
+# before it, so these always load /usr/local's GTSAM, matching the headers built against.
+foreach(target pose_estimator test_data_publisher)
+  set_target_properties(${target} PROPERTIES BUILD_RPATH /usr/local/lib INSTALL_RPATH /usr/local/lib)
+  target_link_options(${target} PRIVATE -Wl,--disable-new-dtags)
+endforeach()
 
 ament_package()
